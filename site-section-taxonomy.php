@@ -3,7 +3,7 @@
  * Plugin Name: Site Section Taxonomy
  * Description: Adds "Site Section" taxonomy to pages for Salibandy and Inssi-Divari sections.
  * Version: 1.0
- * Author: Your Name
+ * Author: Rainers Reds Biezais
  */
 
 // Exit if accessed directly
@@ -11,12 +11,14 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
+// Constants
+define( 'SITE_SECTION_TAXONOMY', 'section' );
+define( 'SITE_SECTION_POST_TYPE', 'page' );
 
 /**
- * Register Custom Taxonomy "Section" for Pages
+ * Register Site Section taxonomy for Pages
  */
 function register_section_taxonomy_for_pages() {
-
     $labels = array(
         'name'              => _x( 'Site Sections', 'taxonomy general name' ),
         'singular_name'     => _x( 'Site Section', 'taxonomy singular name' ),
@@ -24,323 +26,447 @@ function register_section_taxonomy_for_pages() {
         'all_items'         => __( 'All Site Sections' ),
         'edit_item'         => __( 'Edit Site Section' ),
         'update_item'       => __( 'Update Site Section' ),
-        'add_new_item'      => null, 
+        'add_new_item'      => __( 'Add New Site Section' ),
         'new_item_name'     => __( 'New Site Section Name' ),
         'menu_name'         => __( 'Site Section' ),
     );
 
     $args = array(
-        'hierarchical'      => false,
-        'labels'            => $labels,
-        'show_ui'           => true,     
-        'show_admin_column' => true,
-        'query_var'         => true,
-        'rewrite'           => array(
-            'slug' => 'section',
-        ),
-        'show_in_rest'      => true,
-        'meta_box_cb'       => false,
-        'show_in_quick_edit'=> false,
-        'show_in_menu'      => false, 
-        'show_ui'      => false, 
-   
+        'hierarchical'          => true,
+        'labels'                => $labels,
+        'show_ui'               => true,
+        'show_admin_column'     => true,
+        'query_var'             => true,
+        'update_count_callback' => 'update_section_term_count',
+        'rewrite'               => array( 'slug' => 'section' ),
     );
 
-    register_taxonomy( 'section', 'page', $args );
+    register_taxonomy( SITE_SECTION_TAXONOMY, SITE_SECTION_POST_TYPE, $args );
 }
 add_action( 'init', 'register_section_taxonomy_for_pages' );
 
-
+/**
+ * Get post statuses that appear on the Pages list
+ *
+ * @return array
+ */
+function section_get_admin_statuses() {
+    $statuses = get_post_stati( array( 'show_in_admin_all_list' => true ) );
+    return ! empty( $statuses ) ? $statuses : array( 'publish' );
+}
 
 /**
- * Add filter dropdown in Pages admin list
+ * Get page counts for Site Section terms
+ *
+ * @param array $term_ids Optional. Array of term IDs to get counts for.
+ * @param bool  $return_term_taxonomy Optional. Return term_taxonomy_id as key instead of term_id.
+ * @return array
  */
-function filter_pages_by_section( $post_type ) {
-    
-    if ( 'page' !== $post_type ) {
+function section_get_page_counts( $term_ids = array(), $return_term_taxonomy = false ) {
+    global $wpdb;
+
+    $statuses     = section_get_admin_statuses();
+    $placeholders = implode( ', ', array_fill( 0, count( $statuses ), '%s' ) );
+    $select_id   = $return_term_taxonomy ? 'tt.term_taxonomy_id' : 'tt.term_id';
+    $where_terms = '';
+    $params      = array();
+
+    if ( ! empty( $term_ids ) ) {
+        $where_terms = 'AND tt.term_taxonomy_id IN ( ' . implode( ', ', array_fill( 0, count( $term_ids ), '%d' ) ) . ' )';
+        $params      = $term_ids;
+    }
+
+    $sql = "
+        SELECT {$select_id} AS term_key, COUNT( DISTINCT p.ID ) AS count
+        FROM {$wpdb->term_relationships} tr
+        INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+        INNER JOIN {$wpdb->posts} p ON p.ID = tr.object_id
+        WHERE tt.taxonomy = %s
+          {$where_terms}
+          AND p.post_type = %s
+          AND p.post_status IN ( {$placeholders} )
+        GROUP BY {$select_id}
+    ";
+
+    $prepared = $wpdb->prepare(
+        $sql,
+        array_merge( $params, array( SITE_SECTION_TAXONOMY, SITE_SECTION_POST_TYPE ), $statuses )
+    );
+
+    $results = $wpdb->get_results( $prepared, ARRAY_A );
+    $counts  = array();
+
+    if ( $results ) {
+        foreach ( $results as $row ) {
+            $counts[ (int) $row['term_key'] ] = (int) $row['count'];
+        }
+    }
+
+    return $counts;
+}
+
+/**
+ * Update Site Section term counts to include all admin-visible page statuses
+ *
+ * @param array  $terms
+ * @param string $taxonomy
+ */
+function update_section_term_count( $terms, $taxonomy ) {
+    if ( SITE_SECTION_TAXONOMY !== $taxonomy || empty( $terms ) ) {
         return;
     }
 
-    $selected = isset( $_GET['section'] ) ? sanitize_text_field( $_GET['section'] ) : '';
+    $term_ids = wp_list_pluck( $terms, 'term_id' );
+    $counts   = section_get_page_counts( $term_ids, true );
 
-    wp_dropdown_categories( array(
-        'show_option_all' => 'All Site Sections',
-        'taxonomy'        => 'section',
-        'name'            => 'section',
-        'orderby'         => 'name',
-        'selected'        => $selected,
-        'hierarchical'    => false,
-        'show_count'      => true,
-        'hide_empty'      => false,
-        'value_field'     => 'slug',
-    ) );
+    if ( empty( $counts ) ) {
+        return;
+    }
+
+    global $wpdb;
+    foreach ( $counts as $term_taxonomy_id => $count ) {
+        $wpdb->update(
+            $wpdb->term_taxonomy,
+            array( 'count' => $count ),
+            array( 'term_taxonomy_id' => $term_taxonomy_id )
+        );
+    }
 }
-add_action( 'restrict_manage_posts', 'filter_pages_by_section' );
 
 /**
- * Apply taxonomy filter to Pages query
+ * Get cached page counts for Site Section taxonomy
+ *
+ * @return array
+ */
+function get_section_taxonomy_page_counts() {
+    static $cached = null;
+    if ( null === $cached ) {
+        $cached = section_get_page_counts();
+    }
+    return $cached;
+}
+
+/**
+ * Walker class for dropdown with accurate counts
+ */
+class Section_Taxonomy_Dropdown_Walker extends Walker_CategoryDropdown {
+    protected $counts = array();
+
+    public function __construct( $counts = array() ) {
+        $this->counts = $counts;
+    }
+
+    public function start_el( &$output, $category, $depth = 0, $args = array(), $id = 0 ) {
+        $category->count = isset( $this->counts[ $category->term_id ] ) ? (int) $this->counts[ $category->term_id ] : 0;
+        parent::start_el( $output, $category, $depth, $args, $id );
+    }
+}
+
+/**
+ * Add Site Section meta box to Page editor
+ */
+function add_section_meta_box() {
+    add_meta_box(
+        'section-meta-box',
+        __( 'Site Section', 'site-section-taxonomy' ),
+        'render_section_meta_box',
+        SITE_SECTION_POST_TYPE,
+        'side',
+        'default'
+    );
+}
+add_action( 'add_meta_boxes', 'add_section_meta_box' );
+
+/**
+ * Render Site Section dropdown in meta box
+ *
+ * @param WP_Post $post
+ */
+function render_section_meta_box( $post ) {
+    wp_nonce_field( 'save_section_meta_box', 'section_meta_box_nonce' );
+
+    $terms   = wp_get_post_terms( $post->ID, SITE_SECTION_TAXONOMY, array( 'fields' => 'ids' ) );
+    $selected = ! empty( $terms ) ? (int) $terms[0] : '';
+
+    wp_dropdown_categories( array(
+        'show_option_none' => __( '— No Site Section —', 'site-section-taxonomy' ),
+        'taxonomy'         => SITE_SECTION_TAXONOMY,
+        'name'             => 'section_taxonomy_term',
+        'orderby'          => 'name',
+        'selected'         => $selected,
+        'hierarchical'     => true,
+        'depth'            => 4,
+        'hide_empty'       => false,
+    ) );
+}
+
+/**
+ * Save Site Section from meta box or quick edit
+ *
+ * @param int $post_id
+ */
+function save_section_meta_box_data( $post_id ) {
+    if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
+        return;
+    }
+
+    if ( ! isset( $_POST['section_taxonomy_term'] ) ) {
+        return;
+    }
+
+    $nonce = isset( $_POST['section_meta_box_nonce'] ) ? $_POST['section_meta_box_nonce'] : '';
+    if ( ! $nonce && isset( $_POST['section_quick_edit_nonce'] ) ) {
+        $nonce = $_POST['section_quick_edit_nonce'];
+    }
+
+    if ( ! $nonce || ! wp_verify_nonce( $nonce, 'save_section_meta_box' ) ) {
+        return;
+    }
+
+    if ( ! current_user_can( 'edit_post', $post_id ) ) {
+        return;
+    }
+
+    $term_id = intval( $_POST['section_taxonomy_term'] );
+    if ( $term_id > 0 ) {
+        wp_set_post_terms( $post_id, array( $term_id ), SITE_SECTION_TAXONOMY, false );
+    } else {
+        wp_set_post_terms( $post_id, array(), SITE_SECTION_TAXONOMY, false );
+    }
+}
+add_action( 'save_post_page', 'save_section_meta_box_data' );
+
+/**
+ * Add filter dropdown on Pages list screen
+ *
+ * @param string $post_type
+ * @param string $which
+ */
+function filter_pages_by_section( $post_type, $which ) {
+    if ( SITE_SECTION_POST_TYPE !== $post_type ) {
+        return;
+    }
+
+    $taxonomy     = SITE_SECTION_TAXONOMY;
+    $selected     = isset( $_GET[ $taxonomy ] ) ? sanitize_text_field( wp_unslash( $_GET[ $taxonomy ] ) ) : '';
+    $taxonomy_obj = get_taxonomy( $taxonomy );
+    $counts       = get_section_taxonomy_page_counts();
+    $walker       = new Section_Taxonomy_Dropdown_Walker( $counts );
+
+    wp_dropdown_categories( array(
+        'show_option_all' => sprintf( __( 'All %s' ), $taxonomy_obj->label ),
+        'taxonomy'        => $taxonomy,
+        'name'            => $taxonomy,
+        'orderby'         => 'name',
+        'selected'        => $selected,
+        'hierarchical'   => true,
+        'depth'           => 4,
+        'show_count'      => true,
+        'hide_empty'      => false,
+        'walker'          => $walker,
+    ) );
+}
+add_action( 'restrict_manage_posts', 'filter_pages_by_section', 10, 2 );
+
+/**
+ * Apply section filter to admin query
+ *
+ * @param WP_Query $query
  */
 function apply_section_filter_to_query( $query ) {
     global $pagenow;
 
-    if ( 'edit.php' === $pagenow && $query->is_main_query() && isset($_GET['post_type']) && $_GET['post_type'] === 'page' ) {
-        
-        if ( ! empty( $_GET['section'] ) ) {
-            $query->set( 'tax_query', array(
-                array(
-                    'taxonomy' => 'section',
-                    'field'    => 'slug',
-                    'terms'    => sanitize_text_field( $_GET['section'] ),
-                )
-            ) );
-        }
+    if ( ! is_admin() || 'edit.php' !== $pagenow || ! $query->is_main_query() ) {
+        return;
     }
+
+    $post_type = $query->get( 'post_type' );
+    if ( empty( $post_type ) ) {
+        $post_type = isset( $_GET['post_type'] ) ? sanitize_key( $_GET['post_type'] ) : 'post';
+    }
+
+    if ( is_array( $post_type ) ) {
+        $post_type = reset( $post_type );
+    }
+
+    $raw_section = isset( $_GET['section'] ) ? wp_unslash( $_GET['section'] ) : '';
+    if ( SITE_SECTION_POST_TYPE !== $post_type || '' === $raw_section ) {
+        return;
+    }
+
+    $is_numeric = is_numeric( $raw_section );
+    $term_value = $is_numeric ? absint( $raw_section ) : sanitize_title( $raw_section );
+
+    if ( empty( $term_value ) ) {
+        return;
+    }
+
+    $query->set( 'tax_query', array(
+        array(
+            'taxonomy' => SITE_SECTION_TAXONOMY,
+            'field'    => $is_numeric ? 'term_id' : 'slug',
+            'terms'    => array( $term_value ),
+        ),
+    ) );
+    $query->set( 'section', null );
 }
 add_action( 'pre_get_posts', 'apply_section_filter_to_query' );
 
 /**
- * Show Section taxonomy column in Pages list
+ * Refresh Site Section counts when taxonomy admin is loaded
+ */
+function refresh_section_counts_on_admin_load() {
+    global $pagenow;
+
+    if ( 'edit-tags.php' !== $pagenow ) {
+        return;
+    }
+
+    $taxonomy = isset( $_GET['taxonomy'] ) ? sanitize_key( $_GET['taxonomy'] ) : '';
+    if ( SITE_SECTION_TAXONOMY !== $taxonomy ) {
+        return;
+    }
+
+    $counts = section_get_page_counts( array(), true );
+    if ( empty( $counts ) ) {
+        return;
+    }
+
+    global $wpdb;
+    foreach ( $counts as $term_taxonomy_id => $count ) {
+        $wpdb->update(
+            $wpdb->term_taxonomy,
+            array( 'count' => $count ),
+            array( 'term_taxonomy_id' => $term_taxonomy_id )
+        );
+    }
+}
+add_action( 'load-edit-tags.php', 'refresh_section_counts_on_admin_load' );
+
+/**
+ * Add Site Section column to Pages list
+ *
+ * @param array $columns
+ * @return array
  */
 function add_section_column_to_pages( $columns ) {
-    $columns['section'] = 'Site Section';
+    $columns['section'] = __( 'Site Section', 'site-section-taxonomy' );
     return $columns;
 }
 add_filter( 'manage_page_posts_columns', 'add_section_column_to_pages' );
 
 /**
- * Display the assigned Site Section(s) in the Pages list table column.
+ * Render Site Section column content and inline data for quick edit
+ *
+ * @param string $column
+ * @param int    $post_id
  */
 function show_section_column_value( $column, $post_id ) {
-    if ( $column == 'section' ) {
-        $terms = get_the_terms( $post_id, 'section' );
-        if ( $terms && ! is_wp_error( $terms ) ) {
-            echo esc_html( $terms[0]->name );
-        } else {
-            echo '<span aria-hidden="true">—</span><span class="screen-reader-text">None</span>';
+    if ( 'section' !== $column ) {
+        return;
+    }
+
+    $terms = get_the_terms( $post_id, SITE_SECTION_TAXONOMY );
+    $term_id = '';
+
+    if ( ! empty( $terms ) && ! is_wp_error( $terms ) ) {
+        $term_id = $terms[0]->term_id;
+        foreach ( $terms as $term ) {
+            echo esc_html( $term->name ) . '<br>';
         }
     }
+
+    //Added standard inline edit data wrapper so WP copies it to quick edit form
+    printf(
+        '<div class="hidden" id="inline_%d"><div class="section_term_id">%s</div></div>',
+        (int) $post_id,
+        esc_html( $term_id )
+    );
 }
 add_action( 'manage_page_posts_custom_column', 'show_section_column_value', 10, 2 );
 
-
-
 /**
- * Remove the default taxonomy meta box
- */
-function remove_default_section_meta_box() {
-    remove_meta_box( 'sectiondiv', 'page', 'side' );
-}
-add_action( 'admin_menu', 'remove_default_section_meta_box' );
-
-/**
- * Register a custom meta box for Site Section (radio buttons, single selection).
- */
-function add_section_radio_meta_box() {
-    add_meta_box(
-        'section_radio_div',             
-        __( 'Site Section' ),           
-        'section_radio_meta_box_callback', 
-        'page',                          
-        'side',                          
-        'high'                         
-    );
-}
-add_action( 'add_meta_boxes', 'add_section_radio_meta_box' );
-
-/**
- * Display the Site Section radio buttons in the meta box.
+ * Hide default taxonomy checkboxes in Quick Edit
  *
- * @param WP_Post 
+ * @param bool   $show_in_quick_edit
+ * @param string $taxonomy_name
+ * @param string $post_type
+ * @return bool
  */
-function section_radio_meta_box_callback( $post ) {
-    $terms = get_terms( array(
-        'taxonomy'   => 'section',
-        'hide_empty' => false,
-        'orderby'    => 'name',
-    ) );
-
-    if ( is_wp_error( $terms ) || empty( $terms ) ) {
-        echo '<p>' . __( 'No Site Sections found.' ) . '</p>';
-        return;
+function hide_section_taxonomy_in_quick_edit( $show_in_quick_edit, $taxonomy_name, $post_type ) {
+    if ( SITE_SECTION_TAXONOMY === $taxonomy_name && SITE_SECTION_POST_TYPE === $post_type ) {
+        return false;
     }
-
-    $current_terms = wp_get_post_terms( $post->ID, 'section', array( 'fields' => 'ids' ) );
-    $selected = ! empty( $current_terms ) ? (int) $current_terms[0] : 0;
-
-    wp_nonce_field( 'section_radio_save', 'section_radio_nonce' );
-
-    echo '<div class="section-radio-options">';
-    foreach ( $terms as $term ) {
-        printf(
-            '<label style="display:block; margin:6px 0; cursor:pointer;">' .
-            '<input type="radio" name="section_radio" value="%d" %s> %s' .
-            '</label>',
-            esc_attr( $term->term_id ),
-            checked( $selected, $term->term_id, false ),
-            esc_html( $term->name )
-        );
-    }
-    // "None" option
-    printf(
-        '<label style="display:block; margin:6px 0; color:#666; cursor:pointer;">' .
-        '<input type="radio" name="section_radio" value="0" %s> None' .
-        '</label>',
-        checked( $selected, 0, false )
-    );
-    echo '</div>';
+    return $show_in_quick_edit;
 }
+add_filter( 'quick_edit_show_taxonomy', 'hide_section_taxonomy_in_quick_edit', 10, 3 );
 
 /**
- * Save the selected Site Section when the page is saved.
- * Enforces single-term assignment. Value "0" clears the section.
- * @param int 
+ * Add Site Section dropdown to Quick Edit form
+ *
+ * @param string $column_name
+ * @param string $post_type
  */
-function save_section_radio_meta_box( $post_id ) {
-    
-    if ( ! isset( $_POST['section_radio_nonce'] ) ) {
+function add_section_quick_edit_field( $column_name, $post_type ) {
+    if ( 'section' !== $column_name || SITE_SECTION_POST_TYPE !== $post_type ) {
         return;
     }
 
-    $nonce = $_POST['section_radio_nonce'];
-
-    if ( ! wp_verify_nonce( $nonce, 'section_radio_save' ) ) {
-        return;
-    }
-
-    if ( ! current_user_can( 'edit_page', $post_id ) ) {
-        return;
-    }
-
-    if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
-        return;
-    }
-
-    $term_id = isset( $_POST['section_radio'] ) ? (int) $_POST['section_radio'] : 0;
-
-    if ( $term_id > 0 ) {
-        wp_set_post_terms( $post_id, array( $term_id ), 'section', false );
-    } else {
-        wp_set_post_terms( $post_id, array(), 'section', false ); // Remove all
-    }
-}
-add_action( 'save_post_page', 'save_section_radio_meta_box' );
-
-/**
- * Add custom radio buttons to the Quick Edit interface for Site Section.
- */
-add_action( 'quick_edit_custom_box', function( $column_name, $post_type ) {
-    if ( $column_name !== 'section' || $post_type !== 'page' ) {
-        return;
-    }
-
-    $terms = get_terms( array(
-        'taxonomy'   => 'section',
-        'hide_empty' => false,
-        'orderby'    => 'name',
-    ) );
-
-    if ( empty( $terms ) || is_wp_error( $terms ) ) {
-        return;
-    }
-
-    wp_nonce_field( 'section_quick_save', 'section_quick_nonce', false );
+    wp_nonce_field( 'save_section_meta_box', 'section_quick_edit_nonce' );
     ?>
-    <fieldset class="inline-edit-col-left">
-        <div class="inline-edit-col">
-            <label>
-                <span class="title">Site Section</span>
-                <span class="input-text-wrap">
-                    <?php foreach ( $terms as $term ) : ?>
-                        <label style="display:block; margin:3px 0;">
-                            <input type="radio" name="section_quick" value="<?php echo esc_attr( $term->term_id ); ?>">
-                            <?php echo esc_html( $term->name ); ?>
-                        </label>
-                    <?php endforeach; ?>
-                    <label style="display:block; margin:3px 0; color:#666;">
-                        <input type="radio" name="section_quick" value="0">
-                        None
-                    </label>
-                </span>
-            </label>
-        </div>
-    </fieldset>
+    <label>
+        <span class="title"><?php esc_html_e( 'Site Section', 'site-section-taxonomy' ); ?></span>
+        <?php
+        wp_dropdown_categories( array(
+            'show_option_none' => __( '— No Site Section —', 'site-section-taxonomy' ),
+            'taxonomy'         => SITE_SECTION_TAXONOMY,
+            'name'             => 'section_taxonomy_term',
+            'id'               => 'section_taxonomy_term_quick_edit',
+            'orderby'          => 'name',
+            'hierarchical'     => true,
+            'depth'            => 4,
+            'hide_empty'       => false,
+        ) );
+        ?>
+    </label>
     <?php
-}, 10, 2 );
+}
+add_action( 'quick_edit_custom_box', 'add_section_quick_edit_field', 10, 2 );
 
 /**
- * Add term ID as a data attribute to the column for JS access in Quick Edit.
+ * Add JavaScript to prefill Quick Edit dropdown with current Site Section
  */
-add_action( 'manage_page_posts_custom_column', function( $column, $post_id ) {
-    if ( 'section' === $column ) {
-        $terms = get_the_terms( $post_id, 'section' );
-        $term_id = $terms && ! is_wp_error( $terms ) ? (int) $terms[0]->term_id : 0;
-        echo ' data-term-id="' . esc_attr( $term_id ) . '"';
-    }
-}, 5, 2 );
-
-/**
- * Enqueue JavaScript to populate and save Quick Edit values.
- */
-add_action( 'admin_footer', function() {
+function section_quick_edit_inline_js() {
     $screen = get_current_screen();
-    if ( ! $screen || 'edit-page' !== $screen->id ) {
+    if ( ! $screen || SITE_SECTION_POST_TYPE !== $screen->post_type || 'edit-page' !== $screen->id ) {
         return;
     }
     ?>
     <script>
     jQuery(document).ready(function($) {
-        $('#new-tag-section').closest('.taxonomy-field-container').hide();
-        $('#new-tag-section').closest('.components-panel__body').find('.editor-post-taxonomies__hierarchical-terms-add-new').hide(); // Hide if using Gutenberg and default meta box still showing up
-        
-        
-        $(document).on('click', '.editinline', function() {
-            var $row = $(this).closest('tr');
-            var termId = $row.find('.column-section').data('term-id') || 0;
-            setTimeout(function() {
-                $('input[name="section_quick"][value="' + termId + '"]').prop('checked', true);
-            }, 50);
-        });
+        var $wp_inline_edit = inlineEditPost.edit;
+        inlineEditPost.edit = function(id) {
+            $wp_inline_edit.apply(this, arguments);
 
-        var originalSave = window.inlineEditPost && window.inlineEditPost.save;
-        if (originalSave) {
-            window.inlineEditPost.save = function(id) {
-                var val = $('input[name="section_quick"]:checked').val();
-                if (typeof val !== 'undefined') {
-                    var nonce = $('#section_quick_nonce').val() || $('#inline-edit #section_quick_nonce').val();
-                    $.post(ajaxurl, {
-                        action: 'save_section_quick',
-                        post_id: id,
-                        term_id: val,
-                        nonce: nonce
-                    });
-                }
-                return originalSave.apply(this, arguments);
-            };
-        }
+            var postId = typeof(id) === 'object' ? parseInt(this.getId(id), 10) : parseInt(id, 10);
+            if (postId <= 0) return;
+
+            //added wait for the quick edit fields to be inserted
+            setTimeout(function() {
+                var $sectionSelect = $('#section_taxonomy_term_quick_edit');
+                if (!$sectionSelect.length) return;
+
+                // Get data from the hidden inline block in the original row
+                var $origRow = $('#post-' + postId);
+                if (!$origRow.length) return;
+
+                var termId = $origRow.find('#inline_' + postId + ' .section_term_id').text().trim() || '';
+                termId = (termId && parseInt(termId) > 0) ? termId : '';
+                $sectionSelect.val(termId).trigger('change'); 
+            }, 50);
+        };
     });
     </script>
     <?php
-} );
-
-/**
- * AJAX handler to save Site Section from Quick Edit.
- */
-function ajax_save_section_quick() {
-    check_ajax_referer( 'section_quick_save', 'nonce' );
-
-    $post_id = isset( $_POST['post_id'] ) ? absint( $_POST['post_id'] ) : 0;
-    $term_id = isset( $_POST['term_id'] ) ? absint( $_POST['term_id'] ) : 0;
-
-    if ( ! $post_id || ! current_user_can( 'edit_page', $post_id ) ) {
-        wp_die( -1 );
-    }
-
-    if ( $term_id > 0 ) {
-        wp_set_object_terms( $post_id, array( $term_id ), 'section', false );
-    } else {
-        wp_set_object_terms( $post_id, array(), 'section', false );
-    }
-
-    wp_die();
 }
-add_action( 'wp_ajax_save_section_quick', 'ajax_save_section_quick' );
+add_action( 'admin_print_footer_scripts-edit.php', 'section_quick_edit_inline_js' );
